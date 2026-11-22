@@ -5,7 +5,7 @@ from collections.abc import Iterator
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, HTTPException, Query, status
-from sqlite3 import OperationalError
+from sqlite3 import IntegrityError, OperationalError
 
 from . import services
 from .config import MAX_HOUR_RANGE
@@ -18,6 +18,8 @@ from .schemas import (
     MessageOut,
     ReadingIn,
     ReadingOut,
+    SwitchIn,
+    SwitchResultOut,
 )
 from .time_utils import (
     SECONDS_PER_HOUR,
@@ -102,6 +104,12 @@ def put_reading(
         return ReadingOut(**body)
     except (services.ServiceError, TimeFormatError) as exc:
         raise _service_error(exc)
+    except IntegrityError as exc:
+        # 并发下同号插入竞态：写事务已回滚，原明细与重传记录保持不变。
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"编号冲突，写入已回滚: {exc}",
+        )
     except OperationalError as exc:
         # 锁等待超时等：事务已回滚，原始数据与小时结果保持不变。
         raise HTTPException(
@@ -116,6 +124,110 @@ def get_readings(
     conn=Depends(get_conn),
 ) -> list[ReadingOut]:
     return [ReadingOut(**row) for row in services.list_readings(conn, point)]
+
+
+_SWITCH_RESPONSES = {
+    409: {
+        "model": MessageOut,
+        "description": "编号重复/已用、区间重叠、跨界读数或新旧档不一致",
+    },
+    400: {"model": MessageOut, "description": "窗口或时间段不合法"},
+}
+
+
+def _switch(payload: SwitchIn, conn) -> SwitchResultOut:
+    try:
+        with write_transaction(conn):
+            body = services.switch_readings(conn, payload)
+        return SwitchResultOut(**body)
+    except (services.ServiceError, TimeFormatError) as exc:
+        raise _service_error(exc)
+    except IntegrityError as exc:
+        # 并发下同号插入竞态：写事务已回滚，原明细与重传记录保持不变。
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"编号冲突，写入已回滚: {exc}",
+        )
+    except OperationalError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"数据库暂时不可写，请重试: {exc}",
+        )
+
+
+@app.post(
+    "/readings/switch",
+    response_model=SwitchResultOut,
+    status_code=status.HTTP_200_OK,
+    tags=["读数"],
+    responses=_SWITCH_RESPONSES,
+)
+@app.post(
+    "/readings/switchover",
+    response_model=SwitchResultOut,
+    status_code=status.HTTP_200_OK,
+    tags=["读数"],
+    include_in_schema=False,
+    responses=_SWITCH_RESPONSES,
+)
+@app.post(
+    "/readings/replace",
+    response_model=SwitchResultOut,
+    status_code=status.HTTP_200_OK,
+    tags=["读数"],
+    include_in_schema=False,
+    responses=_SWITCH_RESPONSES,
+)
+@app.post(
+    "/readings/migrate",
+    response_model=SwitchResultOut,
+    status_code=status.HTTP_200_OK,
+    tags=["读数"],
+    include_in_schema=False,
+    responses=_SWITCH_RESPONSES,
+)
+@app.post(
+    "/readings/renumber",
+    response_model=SwitchResultOut,
+    status_code=status.HTTP_200_OK,
+    tags=["读数"],
+    include_in_schema=False,
+    responses=_SWITCH_RESPONSES,
+)
+@app.post(
+    "/switchovers",
+    response_model=SwitchResultOut,
+    status_code=status.HTTP_200_OK,
+    tags=["读数"],
+    include_in_schema=False,
+    responses=_SWITCH_RESPONSES,
+)
+def readings_switch(
+    payload: SwitchIn, conn=Depends(get_conn)
+) -> SwitchResultOut:
+    """换档：把某测点某仪器窗口内的历史读数整批换成新平台编号与分段。"""
+    return _switch(payload, conn)
+
+
+@app.post(
+    "/points/{point}/readings/switch",
+    response_model=SwitchResultOut,
+    status_code=status.HTTP_200_OK,
+    tags=["读数"],
+    include_in_schema=False,
+    responses=_SWITCH_RESPONSES,
+)
+def post_point_readings_switch(
+    point: str, payload: SwitchIn, conn=Depends(get_conn)
+) -> SwitchResultOut:
+    """换档（测点取自路径）：请求体中的 point 可省略，若填写必须一致。"""
+    if payload.point is not None and payload.point != point:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"路径测点 {point} 与请求体测点 {payload.point} 不一致",
+        )
+    payload = payload.model_copy(update={"point": point})
+    return _switch(payload, conn)
 
 
 # --------------------------------------------------------------------------- #

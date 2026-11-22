@@ -20,14 +20,17 @@ SCHEMA = """
 PRAGMA journal_mode = WAL;
 
 CREATE TABLE IF NOT EXISTS readings (
-    id          INTEGER PRIMARY KEY,
-    number      TEXT NOT NULL UNIQUE,
-    point       TEXT NOT NULL,
-    role        TEXT NOT NULL CHECK (role IN ('primary', 'backup')),
-    start_ts    INTEGER NOT NULL,
-    end_ts      INTEGER NOT NULL,
-    db_value    REAL NOT NULL,
-    created_at  INTEGER NOT NULL
+    id            INTEGER PRIMARY KEY,
+    number        TEXT NOT NULL UNIQUE,
+    point         TEXT NOT NULL,
+    role          TEXT NOT NULL CHECK (role IN ('primary', 'backup')),
+    start_ts      INTEGER NOT NULL,
+    end_ts        INTEGER NOT NULL,
+    db_value      REAL NOT NULL,
+    created_at    INTEGER NOT NULL,
+    -- 换档后原读数保留在本表（用于原号重传核对），但不再参与明细与计算。
+    superseded    INTEGER NOT NULL DEFAULT 0,
+    superseded_at INTEGER
 );
 
 -- 同一仪器（测点 + 主备角色）的区间互不重叠，靠该索引做排他检查与取数。
@@ -61,6 +64,18 @@ CREATE TABLE IF NOT EXISTS hourly_results (
     updated_at      INTEGER NOT NULL,
     PRIMARY KEY (point, hour_start)
 );
+
+-- 换档批次：记录每次整批切换的窗口与影响行数，便于审计。
+CREATE TABLE IF NOT EXISTS reading_switch_batches (
+    id              INTEGER PRIMARY KEY,
+    point           TEXT NOT NULL,
+    role            TEXT NOT NULL CHECK (role IN ('primary', 'backup')),
+    window_start    INTEGER NOT NULL,
+    window_end      INTEGER NOT NULL,
+    superseded_count INTEGER NOT NULL,
+    inserted_count  INTEGER NOT NULL,
+    created_at      INTEGER NOT NULL
+);
 """
 
 
@@ -90,8 +105,22 @@ def init_db(db_path: str | None = None) -> None:
     conn = connect(path)
     try:
         conn.executescript(SCHEMA)
+        _migrate_readings_columns(conn)
     finally:
         conn.close()
+
+
+def _migrate_readings_columns(conn: sqlite3.Connection) -> None:
+    """为旧版数据库补齐换档所需列（新库在建表时已经包含）。"""
+    columns = {
+        row["name"] for row in conn.execute("PRAGMA table_info(readings)").fetchall()
+    }
+    if "superseded" not in columns:
+        conn.execute(
+            "ALTER TABLE readings ADD COLUMN superseded INTEGER NOT NULL DEFAULT 0"
+        )
+    if "superseded_at" not in columns:
+        conn.execute("ALTER TABLE readings ADD COLUMN superseded_at INTEGER")
 
 
 @contextmanager

@@ -10,11 +10,14 @@ import sqlite3
 import time
 from dataclasses import dataclass
 
-from .schemas import CalibrationIn, ReadingIn, Role
+from .schemas import CalibrationIn, ReadingIn, Role, SwitchIn, SwitchSegmentIn
 from .time_utils import SECONDS_PER_HOUR, format_epoch_second, hours_touching
 
 # dB 转声能时的参考基准，公共因子在平均后会抵消。
 _ENERGY_REF_FACTOR = 0.1
+
+# 单次换档窗口最长 24 小时。
+MAX_SWITCH_WINDOW_SECONDS = 24 * SECONDS_PER_HOUR
 
 
 class ServiceError(Exception):
@@ -99,7 +102,8 @@ def _find_reading_overlap(
     """返回与给定区间重叠的已有读数编号，没有则返回 None。"""
     sql = (
         "SELECT number FROM readings "
-        "WHERE point = ? AND role = ? AND start_ts < ? AND end_ts > ?"
+        "WHERE point = ? AND role = ? AND superseded = 0 "
+        "AND start_ts < ? AND end_ts > ?"
     )
     params: list[object] = [point, role.value, end_ts, start_ts]
     if exclude_number is not None:
@@ -139,6 +143,9 @@ def register_reading(conn: sqlite3.Connection, number: str, payload: ReadingIn) 
 
     返回 (响应体, 是否新建)。同号原样重传视为幂等成功；同号内容不同则冲突。
     读数可补交（任意历史时刻），没有时效限制。
+
+    「同号」覆盖换档后保留的原读数：旧设备按原编号原样重传仍返回原登记内容，
+    同号改报则冲突；新编号若从未使用过则按新读数登记。
     """
     _validate_interval(payload.start, payload.end)
     existing = conn.execute(
@@ -158,6 +165,7 @@ def register_reading(conn: sqlite3.Connection, number: str, payload: ReadingIn) 
             raise ConflictError(
                 f"读数编号 {number} 已存在且内容不同；同号只接受原样重传"
             )
+        # 原样重传：返回原登记内容（换档后也不改成新档内容）。
         return reading_out(existing), False
 
     overlap = _find_reading_overlap(
@@ -186,6 +194,228 @@ def register_reading(conn: sqlite3.Connection, number: str, payload: ReadingIn) 
         conn, payload.point, hours_touching(payload.start, payload.end)
     )
     return reading_out(row), True
+
+
+# --------------------------------------------------------------------------- #
+# 换档：历史读数整批换成新平台编号与分段
+# --------------------------------------------------------------------------- #
+@dataclass(frozen=True)
+class _Segment:
+    number: str
+    start_ts: int
+    end_ts: int
+    db_value: float
+
+
+def _validate_switch_window(start_ts: int, end_ts: int) -> None:
+    _validate_interval(start_ts, end_ts)
+    if end_ts - start_ts > MAX_SWITCH_WINDOW_SECONDS:
+        raise ValidationError("换档窗口最长 24 小时（86400 秒）")
+
+
+def _validate_switch_segments(
+    segments: list[SwitchSegmentIn], window_start: int, window_end: int
+) -> list[_Segment]:
+    """校验新档各段：区间合法、落在窗口内、互不重叠、编号批内唯一。"""
+    if not segments:
+        raise ValidationError("新档至少需要一个段（number/start/end/db）")
+    parsed: list[_Segment] = []
+    seen_numbers: set[str] = set()
+    for seg in segments:
+        _validate_interval(seg.start, seg.end)
+        if seg.start < window_start or seg.end > window_end:
+            raise ValidationError(
+                f"新档段 {seg.number} 必须完全落在窗口 "
+                f"[{format_epoch_second(window_start)}, "
+                f"{format_epoch_second(window_end)}) 内"
+            )
+        if seg.number in seen_numbers:
+            raise ConflictError(f"新档编号 {seg.number} 在本次提交中重复")
+        seen_numbers.add(seg.number)
+        parsed.append(
+            _Segment(
+                number=seg.number,
+                start_ts=seg.start,
+                end_ts=seg.end,
+                db_value=float(seg.db),
+            )
+        )
+
+    parsed.sort(key=lambda item: item.start_ts)
+    for previous, current in zip(parsed, parsed[1:]):
+        if previous.end_ts > current.start_ts:
+            raise ConflictError(
+                f"新档段 {previous.number} 与 {current.number} 的区间重叠"
+            )
+    return parsed
+
+
+def _assert_new_numbers_unused(conn: sqlite3.Connection, numbers: set[str]) -> None:
+    """新编号必须从未用于任何读数（含换档后保留的原读数）。"""
+    if not numbers:
+        return
+    placeholders = ", ".join("?" for _ in numbers)
+    rows = conn.execute(
+        f"SELECT number FROM readings WHERE number IN ({placeholders})",
+        sorted(numbers),
+    ).fetchall()
+    if rows:
+        raise ConflictError(
+            f"新档编号 {rows[0]['number']} 已用于其他读数，换档编号必须是全新编号"
+        )
+
+
+def _switch_old_segments(
+    conn: sqlite3.Connection, point: str, role: Role, window_start: int, window_end: int
+) -> list[sqlite3.Row]:
+    """取窗口内该仪器的有效读数；任何跨越窗口边界的读数都拒绝换档。"""
+    rows = conn.execute(
+        "SELECT * FROM readings WHERE point = ? AND role = ? AND superseded = 0 "
+        "AND start_ts < ? AND end_ts > ? ORDER BY start_ts",
+        (point, role.value, window_end, window_start),
+    ).fetchall()
+    for row in rows:
+        if row["start_ts"] < window_start or row["end_ts"] > window_end:
+            raise ConflictError(
+                f"已有读数 {row['number']} 跨越换档窗口边界，不能整批切换"
+            )
+    return list(rows)
+
+
+def _coverage_matches(
+    old_rows: list[sqlite3.Row], new_segments: list[_Segment]
+) -> bool:
+    """逐秒比较旧档与新档：覆盖的秒必须完全相同，且每秒原始分贝相同。
+
+    两边的区间各自互不重叠；按所有端点切分后逐片比较即可。
+    """
+    old = [(r["start_ts"], r["end_ts"], float(r["db_value"])) for r in old_rows]
+    new = [(s.start_ts, s.end_ts, s.db_value) for s in new_segments]
+    points: set[int] = set()
+    for segments in (old, new):
+        for start, end, _ in segments:
+            points.add(start)
+            points.add(end)
+    if not points:
+        return True
+
+    ordered = sorted(points)
+    old_index = new_index = 0
+    for slice_start, slice_end in zip(ordered, ordered[1:]):
+        while old_index < len(old) and old[old_index][1] <= slice_start:
+            old_index += 1
+        while new_index < len(new) and new[new_index][1] <= slice_start:
+            new_index += 1
+        old_db = (
+            old[old_index][2]
+            if old_index < len(old) and old[old_index][0] <= slice_start
+            else None
+        )
+        new_db = (
+            new[new_index][2]
+            if new_index < len(new) and new[new_index][0] <= slice_start
+            else None
+        )
+        if (old_db is None) != (new_db is None):
+            return False
+        if old_db is not None and not math.isclose(
+            old_db, new_db, rel_tol=0.0, abs_tol=1e-9
+        ):
+            return False
+    return True
+
+
+def switch_readings(conn: sqlite3.Connection, payload: SwitchIn) -> dict:
+    """把某测点某仪器的窗口内历史读数整批换成新平台编号与分段。
+
+    校验全部通过后才落地：原读数标记为已被替换（仍保留用于原号重传），
+    新档整批插入。小时结果沿用原值，不在换档时重算；后续校准变更会基于
+    新档重算。任何校验或写入失败都由外层事务整体回滚。
+    """
+    window_start = payload.start
+    window_end = payload.end
+    if not payload.point:
+        raise ValidationError("必须指定换档测点 point")
+    _validate_switch_window(window_start, window_end)
+    role = Role(payload.role)
+    new_segments = _validate_switch_segments(
+        payload.segments, window_start, window_end
+    )
+    _assert_new_numbers_unused(conn, {seg.number for seg in new_segments})
+    for seg in payload.segments:
+        if seg.point is not None and seg.point != payload.point:
+            raise ValidationError(f"新档段 {seg.number} 的测点与换档测点不一致")
+        if seg.role is not None and seg.role != role:
+            raise ValidationError(f"新档段 {seg.number} 的主备角色与换档角色不一致")
+
+    old_rows = _switch_old_segments(
+        conn, payload.point, role, window_start, window_end
+    )
+    if not old_rows:
+        raise ConflictError(
+            "换档窗口内没有可切换的历史读数，请确认测点、主备角色与窗口"
+        )
+    if not _coverage_matches(old_rows, new_segments):
+        raise ConflictError(
+            "新旧档覆盖的秒或每秒原始分贝不一致，不能整批切换"
+        )
+
+    now = int(time.time())
+    for row in old_rows:
+        conn.execute(
+            "UPDATE readings SET superseded = 1, superseded_at = ? WHERE id = ?",
+            (now, row["id"]),
+        )
+    for seg in new_segments:
+        conn.execute(
+            "INSERT INTO readings (number, point, role, start_ts, end_ts, db_value, "
+            "created_at, superseded) VALUES (?, ?, ?, ?, ?, ?, ?, 0)",
+            (
+                seg.number,
+                payload.point,
+                role.value,
+                seg.start_ts,
+                seg.end_ts,
+                seg.db_value,
+                now,
+            ),
+        )
+    conn.execute(
+        "INSERT INTO reading_switch_batches (point, role, window_start, window_end, "
+        "superseded_count, inserted_count, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            payload.point,
+            role.value,
+            window_start,
+            window_end,
+            len(old_rows),
+            len(new_segments),
+            now,
+        ),
+    )
+
+    # 小时结果沿用原值：不调用 recompute_hours。新旧档逐秒原始分贝相同，
+    # 因此原结果在任何口径下都一致；后续校准变更时会按新档重算。
+    ordered_rows: list[sqlite3.Row] = []
+    ordered_input = list(new_segments)
+    if ordered_input:
+        rows = conn.execute(
+            "SELECT * FROM readings WHERE number IN "
+            f"({', '.join('?' for _ in ordered_input)})",
+            [seg.number for seg in ordered_input],
+        ).fetchall()
+        by_number = {row["number"]: row for row in rows}
+        ordered_rows = [by_number[seg.number] for seg in ordered_input]
+
+    return {
+        "point": payload.point,
+        "role": role,
+        "start": format_epoch_second(window_start),
+        "end": format_epoch_second(window_end),
+        "superseded": len(old_rows),
+        "inserted": len(new_segments),
+        "readings": [reading_out(row) for row in ordered_rows],
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -359,8 +589,8 @@ def _compute_hour(
     """计算单个测点单个 UTC 小时的结果；无任何覆盖返回 None。"""
     hour_end = hour_start + SECONDS_PER_HOUR
     rows = conn.execute(
-        "SELECT * FROM readings WHERE point = ? AND start_ts < ? AND end_ts > ? "
-        "ORDER BY start_ts, role",
+        "SELECT * FROM readings WHERE point = ? AND superseded = 0 "
+        "AND start_ts < ? AND end_ts > ? ORDER BY start_ts, role",
         (point, hour_end, hour_start),
     ).fetchall()
     if not rows:
@@ -490,11 +720,16 @@ def list_hour_results(
 
 
 def list_readings(conn: sqlite3.Connection, point: str | None) -> list[dict]:
+    """明细查询：只列当前有效读数，换档窗口内仅剩新档。"""
     if point is None:
-        rows = conn.execute("SELECT * FROM readings ORDER BY point, start_ts").fetchall()
+        rows = conn.execute(
+            "SELECT * FROM readings WHERE superseded = 0 ORDER BY point, start_ts"
+        ).fetchall()
     else:
         rows = conn.execute(
-            "SELECT * FROM readings WHERE point = ? ORDER BY start_ts", (point,)
+            "SELECT * FROM readings WHERE point = ? AND superseded = 0 "
+            "ORDER BY start_ts",
+            (point,),
         ).fetchall()
     return [reading_out(r) for r in rows]
 
